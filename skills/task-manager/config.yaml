@@ -1,0 +1,29 @@
+name: "Задачник"
+type: executor
+description: "Управление задачами в Todoist"
+
+llm:
+  provider: anthropic
+  model: haiku
+  max_tokens: 1000
+  temperature: 0.3
+
+tools:
+  - memory_read
+  - todoist_api
+  - ask_user
+
+priority: 2
+
+triggers:
+  - "задача"
+  - "напомни"
+  - "тудуист"
+  - "что на сегодня"
+  - "что на завтра"
+  - "дела"
+
+cron:
+  - schedule: "0 8 * * *"
+    intent: "Показать задачи на сегодня"
+    silent: false
