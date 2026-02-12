@@ -25,8 +25,10 @@ from src.gateway.responder import send_response
 from src.dispatcher import Dispatcher as OpenEchoDispatcher, SkillOutput, SkillInput
 from src.config_loader import load_skills
 from src.session import SessionState
-from src.queue import IntentQueue, QueuedIntent
+from src.queue import IntentQueue
 from src.debug.telegram import DebugManager
+from src.debug.web import app as debug_app, broadcast_event
+import uvicorn
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -36,6 +38,12 @@ session: SessionState | None = None
 dispatcher: OpenEchoDispatcher | None = None
 debug_mgr = DebugManager()
 bot_instance: Bot | None = None
+
+
+async def _track(debug_events: list[dict], event: dict) -> None:
+    """Append debug event locally and broadcast to web console."""
+    debug_events.append(event)
+    await broadcast_event(event)
 
 
 async def run_skill(skill_id: str, skill_input: SkillInput) -> SkillOutput:
@@ -96,18 +104,18 @@ async def on_message(message: types.Message) -> None:
             await message.answer("Не удалось обработать сообщение. Попробуй текстом.")
             return
 
-        debug_events.append({"component": "input", "action": f"type={msg_type.value}"})
+        await _track(debug_events, {"component": "input", "action": f"type={msg_type.value}"})
 
         # 2. Gateway: read state
         state = await session.get(user_id)
         active_skill = state.get("active_skill", "")
         status = state.get("status", "idle")
 
-        debug_events.append({"component": "gateway.state", "action": f"skill={active_skill or 'none'}, status={status}"})
+        await _track(debug_events, {"component": "gateway.state", "action": f"skill={active_skill or 'none'}, status={status}"})
 
         # 3. Gateway Level 1: fast filter
         filter_result = fast_filter(text, active_skill, status)
-        debug_events.append({"component": "gateway.level1", "action": filter_result.decision.value})
+        await _track(debug_events, {"component": "gateway.level1", "action": filter_result.decision.value})
 
         if filter_result.decision == FilterDecision.TO_ACTIVE_SKILL and active_skill:
             output = await dispatcher.handle_message_to_active(user_id, text)
@@ -117,7 +125,7 @@ async def on_message(message: types.Message) -> None:
 
         # 4. Match skill by triggers (skip LLM intent parsing — no Anthropic key yet)
         skill_id = dispatcher.match_skill(text)
-        debug_events.append({"component": "dispatcher", "action": f"match={skill_id or 'none'}"})
+        await _track(debug_events, {"component": "dispatcher", "action": f"match={skill_id or 'none'}"})
 
         if not skill_id:
             await message.answer("Не понял, что сделать. Попробуй иначе.")
@@ -127,7 +135,7 @@ async def on_message(message: types.Message) -> None:
         # 5. Add to queue and dispatch
         config = dispatcher._registry.get(skill_id)
         pri = config.priority if config else 5
-        dispatcher._queue.add(QueuedIntent(text=text, skill_hint=skill_id, priority=pri))
+        dispatcher._queue.add(text, priority=pri, skill_hint=skill_id)
 
         output = await dispatcher.dispatch_next(user_id)
         if output:
@@ -191,6 +199,12 @@ async def main() -> None:
     bot_instance = Bot(token=token)
     dp = AiogramDP()
     dp.include_router(router)
+
+    # Debug web console
+    uvi_config = uvicorn.Config(debug_app, host="0.0.0.0", port=8484, log_level="warning")
+    uvi_server = uvicorn.Server(uvi_config)
+    asyncio.create_task(uvi_server.serve())
+    logger.info("Debug web console on :8484")
 
     logger.info("Starting OpenEcho bot...")
     try:
