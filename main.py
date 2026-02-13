@@ -61,6 +61,14 @@ async def run_skill(skill_id: str, skill_input: SkillInput) -> SkillOutput:
             text=result.get("text", ""),
             done=result.get("done", True),
         )
+    if skill_id == "chatbot":
+        from skills.chatbot.handler import handle as chatbot_handle
+        result = await chatbot_handle(skill_input.intent, context=skill_input.context)
+        return SkillOutput(
+            type=result.get("type", "error"),
+            text=result.get("text", ""),
+            done=result.get("done", True),
+        )
     return SkillOutput(type="error", text=f"Скилл '{skill_id}' пока не реализован", done=True)
 
 
@@ -175,13 +183,12 @@ async def on_message(message: types.Message) -> None:
         })
 
         if dispatcher._queue.is_empty():
+            # Fallback: chatbot handles everything unmatched
+            dispatcher._queue.add(text, priority=99, skill_hint="chatbot")
             await _track(debug_events, {
-                "step": "error", "label": "∅",
-                "detail": "no skill matched",
+                "step": "queue", "label": "×1",
+                "detail": "fallback → chatbot",
             })
-            await message.answer("Не понял, что сделать. Попробуй иначе.")
-            await _send_debug(chat_id, debug_events, user_id)
-            return
 
         # Dispatch all queued intents
         output = await dispatcher.dispatch_next(user_id)

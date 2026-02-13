@@ -1,0 +1,11 @@
+name: Собеседник
+type: executor
+description: Отвечает на любые сообщения, которые не относятся к другим скиллам
+llm:
+  provider: anthropic
+  model: haiku
+  max_tokens: 1000
+  temperature: 0.5
+tools: []
+priority: 99
+triggers: []
