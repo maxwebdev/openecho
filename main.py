@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import sys
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher as AiogramDP, Router, types
 from aiogram.filters import CommandStart, Command
@@ -43,6 +44,9 @@ bot_instance: Bot | None = None
 
 async def _track(debug_events: list[dict], event: dict) -> None:
     """Append debug event locally and broadcast to web console."""
+    event["ts"] = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    if debug_events and "msg_id" in debug_events[0]:
+        event["msg_id"] = debug_events[0]["msg_id"]
     debug_events.append(event)
     await broadcast_event(event)
 
@@ -105,20 +109,39 @@ async def on_message(message: types.Message) -> None:
             await message.answer("Не удалось обработать сообщение. Попробуй текстом.")
             return
 
-        await _track(debug_events, {"component": "input", "action": f"type={msg_type.value}"})
+        import uuid as _uuid
+        msg_id = _uuid.uuid4().hex[:8]
+        await _track(debug_events, {
+            "msg_id": msg_id, "user_text": text[:80],
+            "step": "input", "label": msg_type.value,
+            "detail": f"type={msg_type.value}",
+        })
 
         # 2. Gateway: read state
         state = await session.get(user_id)
         active_skill = state.get("active_skill", "")
         status = state.get("status", "idle")
 
-        await _track(debug_events, {"component": "gateway.state", "action": f"skill={active_skill or 'none'}, status={status}"})
+        await _track(debug_events, {
+            "step": "session", "label": "state",
+            "detail": f"skill={active_skill or 'none'}, status={status}",
+        })
 
         # 3. If active skill is waiting for answer, forward directly
         if active_skill and status == "waiting_answer":
             output = await dispatcher.handle_message_to_active(user_id, text)
             if output:
-                await _track(debug_events, {"component": "dispatcher", "action": f"forward to {active_skill}"})
+                await _track(debug_events, {
+                    "step": "forward", "label": active_skill,
+                    "detail": f"→ {active_skill} (waiting_answer)",
+                })
+                await _track(debug_events, {
+                    "step": "skill", "label": active_skill,
+                    "detail": f"{active_skill}: {output.type}",
+                })
+                await _track(debug_events, {
+                    "step": "response", "label": "ответ",
+                })
                 await _send_output(chat_id, output, debug_events, user_id)
                 return
 
@@ -129,23 +152,33 @@ async def on_message(message: types.Message) -> None:
         skill_names = list(dispatcher._registry.keys())
         parse_result = await parse_intents(text, llm_call=_llm_call, skill_names=skill_names)
 
+        intents_summary = "; ".join(pi.text[:40] for pi in parse_result.intents)
         await _track(debug_events, {
-            "component": "gateway.level2",
-            "action": f"intents={len(parse_result.intents)}: "
-                      + "; ".join(pi.text[:40] for pi in parse_result.intents),
+            "step": "gateway", "label": f"LLM({len(parse_result.intents)})",
+            "detail": f"intents: {intents_summary}",
         })
 
         # 5. Queue parsed intents and dispatch
+        matched_skills = []
         for pi in parse_result.intents:
             skill_id = dispatcher.match_skill(pi.text, pi.skill_hint)
             if skill_id:
                 config = dispatcher._registry.get(skill_id)
                 pri = config.priority if config else 5
                 dispatcher._queue.add(pi.text, priority=pri, skill_hint=skill_id)
+                matched_skills.append(f"{skill_id}←{pi.skill_hint or 'trigger'}")
 
-        await _track(debug_events, {"component": "dispatcher", "action": f"queued={dispatcher._queue.size()}"})
+        queue_size = dispatcher._queue.size()
+        await _track(debug_events, {
+            "step": "queue", "label": f"×{queue_size}",
+            "detail": f"matched: {', '.join(matched_skills)}" if matched_skills else "no matches",
+        })
 
         if dispatcher._queue.is_empty():
+            await _track(debug_events, {
+                "step": "error", "label": "∅",
+                "detail": "no skill matched",
+            })
             await message.answer("Не понял, что сделать. Попробуй иначе.")
             await _send_debug(chat_id, debug_events, user_id)
             return
@@ -153,12 +186,39 @@ async def on_message(message: types.Message) -> None:
         # Dispatch all queued intents
         output = await dispatcher.dispatch_next(user_id)
         if output:
+            skill_state = await session.get(user_id)
+            skill_name = skill_state.get("active_skill", "?")
+            await _track(debug_events, {
+                "step": "dispatcher", "label": "dispatch",
+                "detail": f"→ {skill_name or 'done'}",
+            })
+            await _track(debug_events, {
+                "step": "skill", "label": skill_name or "skill",
+                "detail": f"output: {output.type}, done={output.done}",
+            })
+            await _track(debug_events, {
+                "step": "response", "label": "ответ",
+            })
             await _send_output(chat_id, output, debug_events, user_id)
 
             while output and output.done and not dispatcher._queue.is_empty():
                 output = await dispatcher.dispatch_next(user_id)
                 if output:
-                    await _send_output(chat_id, output, [], user_id)
+                    chain_events: list[dict] = []
+                    chain_state = await session.get(user_id)
+                    chain_skill = chain_state.get("active_skill", "?")
+                    await _track(chain_events, {
+                        "step": "dispatcher", "label": "chain",
+                        "detail": f"→ {chain_skill or 'done'} (from queue)",
+                    })
+                    await _track(chain_events, {
+                        "step": "skill", "label": chain_skill or "skill",
+                        "detail": f"output: {output.type}, done={output.done}",
+                    })
+                    await _track(chain_events, {
+                        "step": "response", "label": "ответ",
+                    })
+                    await _send_output(chat_id, output, chain_events, user_id)
 
     except Exception as e:
         logger.exception("Error processing message")

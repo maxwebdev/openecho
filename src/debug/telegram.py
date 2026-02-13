@@ -1,10 +1,25 @@
 """OpenEcho Debug Telegram — atom 10.1.
 
 /debug on/off command, appends debug block under bot responses.
+Shows full message route through the pipeline.
 """
 from __future__ import annotations
 
 from typing import Any
+
+
+# Icons for each pipeline component
+ICONS = {
+    "input": "📩",
+    "session": "💾",
+    "forward": "↩️",
+    "gateway": "🧠",
+    "queue": "📋",
+    "dispatcher": "⚡",
+    "skill": "🎯",
+    "response": "💬",
+    "error": "❌",
+}
 
 
 class DebugManager:
@@ -23,17 +38,33 @@ class DebugManager:
         return user_id in self._enabled
 
     def format_debug_block(self, events: list[dict[str, Any]]) -> str:
-        """Format debug events into a Telegram-friendly block."""
+        """Format debug events as a visual message route."""
         if not events:
             return ""
-        lines = ["──── debug ────"]
+
+        lines: list[str] = []
+        route_parts: list[str] = []
+
         for ev in events:
-            component = ev.get("component", "?")
-            action = ev.get("action", "?")
-            line = f"{component}: {action}"
-            if "llm_call" in ev:
-                llm = ev["llm_call"]
-                line += f" ({llm.get('model', '?')}, {llm.get('prompt_tokens', 0)}+{llm.get('completion_tokens', 0)} tok)"
-            lines.append(line)
-        lines.append("───────────────")
-        return "\n".join(lines)
+            step = ev.get("step", "")
+            icon = ICONS.get(step, "•")
+            label = ev.get("label", "")
+            detail = ev.get("detail", "")
+
+            if label:
+                route_parts.append(f"{icon}{label}")
+
+            if detail:
+                lines.append(f"  {icon} {detail}")
+
+        # Build route line
+        route = " → ".join(route_parts) if route_parts else ""
+
+        result = ["─── route ───"]
+        if route:
+            result.append(route)
+        if lines:
+            result.extend(lines)
+        result.append("─────────────")
+
+        return "\n".join(result)
