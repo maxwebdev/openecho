@@ -20,8 +20,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "skills", "task-manag
 
 from src.input.detector import detect_type, MessageType
 from src.input.normalizer import normalize
-from src.gateway.fast_filter import fast_filter, FilterDecision
+from src.gateway.intent_parser import parse_intents
 from src.gateway.responder import send_response
+from src.skill_runtime.llm import call_llm
 from src.dispatcher import Dispatcher as OpenEchoDispatcher, SkillOutput, SkillInput
 from src.config_loader import load_skills
 from src.session import SessionState
@@ -113,35 +114,47 @@ async def on_message(message: types.Message) -> None:
 
         await _track(debug_events, {"component": "gateway.state", "action": f"skill={active_skill or 'none'}, status={status}"})
 
-        # 3. Gateway Level 1: fast filter
-        filter_result = fast_filter(text, active_skill, status)
-        await _track(debug_events, {"component": "gateway.level1", "action": filter_result.decision.value})
-
-        if filter_result.decision == FilterDecision.TO_ACTIVE_SKILL and active_skill:
+        # 3. If active skill is waiting for answer, forward directly
+        if active_skill and status == "waiting_answer":
             output = await dispatcher.handle_message_to_active(user_id, text)
             if output:
+                await _track(debug_events, {"component": "dispatcher", "action": f"forward to {active_skill}"})
                 await _send_output(chat_id, output, debug_events, user_id)
                 return
 
-        # 4. Match skill by triggers (skip LLM intent parsing — no Anthropic key yet)
-        skill_id = dispatcher.match_skill(text)
-        await _track(debug_events, {"component": "dispatcher", "action": f"match={skill_id or 'none'}"})
+        # 4. Level 2: LLM intent parsing
+        async def _llm_call(system: str, user: str) -> str:
+            return await call_llm(system, user, model="haiku", max_tokens=300)
 
-        if not skill_id:
+        skill_names = list(dispatcher._registry.keys())
+        parse_result = await parse_intents(text, llm_call=_llm_call, skill_names=skill_names)
+
+        await _track(debug_events, {
+            "component": "gateway.level2",
+            "action": f"intents={len(parse_result.intents)}: "
+                      + "; ".join(pi.text[:40] for pi in parse_result.intents),
+        })
+
+        # 5. Queue parsed intents and dispatch
+        for pi in parse_result.intents:
+            skill_id = dispatcher.match_skill(pi.text, pi.skill_hint)
+            if skill_id:
+                config = dispatcher._registry.get(skill_id)
+                pri = config.priority if config else 5
+                dispatcher._queue.add(pi.text, priority=pri, skill_hint=skill_id)
+
+        await _track(debug_events, {"component": "dispatcher", "action": f"queued={dispatcher._queue.size()}"})
+
+        if dispatcher._queue.is_empty():
             await message.answer("Не понял, что сделать. Попробуй иначе.")
             await _send_debug(chat_id, debug_events, user_id)
             return
 
-        # 5. Add to queue and dispatch
-        config = dispatcher._registry.get(skill_id)
-        pri = config.priority if config else 5
-        dispatcher._queue.add(text, priority=pri, skill_hint=skill_id)
-
+        # Dispatch all queued intents
         output = await dispatcher.dispatch_next(user_id)
         if output:
             await _send_output(chat_id, output, debug_events, user_id)
 
-            # Chain: if done and queue not empty, dispatch next
             while output and output.done and not dispatcher._queue.is_empty():
                 output = await dispatcher.dispatch_next(user_id)
                 if output:
